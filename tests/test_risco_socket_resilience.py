@@ -30,6 +30,288 @@ from pyrisco.local import risco_socket
 from pyrisco.local.risco_socket import MAX_CMD_ID, RiscoSocket
 
 
+class CommandIdTest(unittest.IsolatedAsyncioTestCase):
+  """Two commands must never share an id while both wait for a reply."""
+
+  async def test_error_without_an_id_does_not_rewind_the_counter(self):
+    """The old code decremented here, so the next command reused a live id."""
+    sock = connected_socket()
+    sock._cmd_id = 2
+    first = asyncio.get_running_loop().create_future()
+    second = asyncio.get_running_loop().create_future()
+    sock._futures[0], sock._futures[1] = first, second
+    scripted_reader(sock, [(None, 'N05', True)])
+    sock._listen_task = None
+
+    await asyncio.wait_for(sock._listen(), LOOP_TIMEOUT)
+
+    self.assertEqual(sock._cmd_id, 2)
+    # The error cannot be tied to either command, so neither is failed by
+    # it; only the connection loss that ends the script fails them.
+    for future in (first, second):
+      self.assertEqual(str(future.exception()), 'Connection lost')
+    reported = drain(sock._queue)
+    self.assertIsInstance(reported[0], CommunicationError,
+                          'An id-less error must not fail a specific command.')
+    self.assertIn('N05', str(reported[0]))
+
+  async def test_next_id_skips_ids_still_waiting(self):
+    sock = connected_socket()
+    sock._cmd_id = 1
+    sock._futures[1] = asyncio.get_running_loop().create_future()
+
+    self.assertEqual(sock._next_cmd_id(), 3)
+    sock._futures[1].cancel()
+
+  async def test_ids_wrap_from_49_to_1(self):
+    sock = connected_socket()
+    sock._cmd_id = MAX_CMD_ID
+
+    self.assertEqual(sock._next_cmd_id(), 1)
+
+  async def test_an_id_is_taken_until_its_slot_is_cleared(self):
+    """Reserve an ID until its slot is cleared, even if its future has finished."""
+    sock = connected_socket()
+    done = asyncio.get_running_loop().create_future()
+    done.set_result('ACK')
+    sock._futures[0] = done
+
+    self.assertEqual(sock._next_cmd_id(), 2)
+    sock._futures[0] = None
+    sock._cmd_id = MAX_CMD_ID
+    self.assertEqual(sock._next_cmd_id(), 1)
+
+  async def test_a_command_cancelled_a_moment_ago_keeps_its_id(self):
+    """Keep a cancelled command's ID reserved while its cleanup is pending.
+
+    Otherwise a late reply could answer the next command using that ID.
+    """
+    sock, reader = await self._listening()
+    arm = asyncio.create_task(sock.send_ack_command('ARM=1'))
+    await settle()
+    self.assertEqual(sock.sent[-1], (1, 'ARM=1'))
+    for n in range(2, MAX_CMD_ID + 1):
+      task = asyncio.create_task(sock.send_command(f'ZLBL*{n}?'))
+      await settle()
+      reader.push(sock.sent[-1][0], f'ZLBL*{n}=x')
+      await asyncio.wait_for(task, LOOP_TIMEOUT)
+
+    arm.cancel()
+    # Before the cancelled command has run again.
+    self.assertNotEqual(sock._next_cmd_id(), 1)
+
+    with self.assertRaises(asyncio.CancelledError):
+      await arm
+    self.assertTrue(sock._held[0])
+
+  async def test_replies_reach_the_right_caller_after_an_id_less_error(self):
+    """A reply must not answer a command it does not belong to.
+
+    With two queries in flight, an id-less N05 used to rewind the counter,
+    so the next query was sent with the id of one still waiting. The panel's
+    reply to the old query then answered the new one - with the wrong data.
+    """
+    sock = connected_socket(concurrency=4)
+    reader = FeedReader(sock)
+    listener = asyncio.create_task(sock._listen())
+    sock._listen_task = listener
+    self.addCleanup(listener.cancel)
+
+    zone_type = asyncio.create_task(sock.send_result_command('ZTYPE*1?'))
+    zone_status = asyncio.create_task(sock.send_result_command('ZSTT*2?'))
+    await settle()
+    reader.push(None, 'N05')
+    await settle()
+    zone_label = asyncio.create_task(sock.send_result_command('ZLBL*3?'))
+    await settle()
+
+    ids = {command: cmd_id for cmd_id, command in sock.sent}
+    self.assertEqual(len(set(ids.values())), 3, f'an id was reused: {sock.sent}')
+
+    reader.push(ids['ZSTT*2?'], 'ZSTT*2=O---')
+    reader.push(ids['ZLBL*3?'], 'ZLBL*3=Front door')
+    reader.push(ids['ZTYPE*1?'], 'ZTYPE*1=1')
+    results = await asyncio.wait_for(
+        asyncio.gather(zone_type, zone_status, zone_label), LOOP_TIMEOUT)
+
+    self.assertEqual(results, ['1', 'O---', 'Front door'])
+
+
+  async def _listening(self, concurrency=4):
+    sock = connected_socket(concurrency=concurrency)
+    reader = FeedReader(sock)
+    listener = asyncio.create_task(sock._listen())
+    sock._listen_task = listener
+    self.addCleanup(listener.cancel)
+    return sock, reader
+
+  async def _time_out_on_id_1(self, sock, command):
+    with patch_timing(COMMAND_TIMEOUT=0.05):
+      with self.assertRaises(CommunicationError):
+        await sock.send_result_command(command)
+    self.assertEqual(sock.sent[-1], (1, command))
+    # The other 48 ids come and go; the next command gets id 1 again.
+    sock._cmd_id = MAX_CMD_ID
+
+  async def test_no_late_reply_reaches_the_command_sent_after_it(self):
+    """Hold unanswered command IDs so late replies cannot reach another caller.
+
+    A late query result, ACK or refusal carries only its command ID. Reusing
+    that ID could return the wrong data, acknowledge an unrelated control, or
+    fail a later command. Keep the ID until its reply arrives or the session ends.
+    """
+    cases = [
+        ('ZLBL*7?', 'ZLBL*7=Garage', 'ZLBL*8?', 'ZLBL*8=Porch'),
+        ('ARM=1', 'ACK', 'DISARM=1', 'ACK'),
+        ('ARM=1', 'N05', 'DISARM=1', 'ACK'),
+        ('ZLBL*7?', 'N05', 'ZLBL*8?', 'ZLBL*8=Porch'),
+        ('ZLBL*7?', 'ZLBL*7=Garage', 'ARM=1', 'ACK'),
+    ]
+    for first, late, second, answer in cases:
+      with self.subTest(first=first, late=late, second=second):
+        sock, reader = await self._listening()
+        await self._time_out_on_id_1(sock, first)
+
+        task = asyncio.create_task(sock.send_command(second))
+        await settle()
+        self.assertEqual(sock.sent[-1], (2, second), 'Keep the unanswered command ID reserved for its late reply.')
+        reader.push(1, late)
+        await settle()
+        self.assertFalse(task.done(), f'the late {late} reached {second}')
+
+        reader.push(2, answer)
+        self.assertEqual(await asyncio.wait_for(task, LOOP_TIMEOUT), answer)
+
+  async def test_the_late_reply_releases_its_id(self):
+    sock, reader = await self._listening()
+    await self._time_out_on_id_1(sock, 'ARM=1')
+    self.assertEqual(sock._next_cmd_id(), 2)
+
+    reader.push(1, 'ACK')
+    await settle()
+    sock._cmd_id = MAX_CMD_ID
+
+    self.assertEqual(sock._next_cmd_id(), 1)
+
+  async def test_a_held_id_stays_held_however_late_its_reply(self):
+    """Keep an ID reserved until its reply arrives, regardless of elapsed time.
+
+    A time limit would let a late ARM acknowledgement acknowledge DISARM
+    after the ID was reused.
+    """
+    sock, reader = await self._listening()
+    await self._time_out_on_id_1(sock, 'ARM=1')
+
+    # Advance the clock by an hour and cycle the other IDs several times.
+    # Neither elapsed time nor unrelated replies may release the held ID.
+    class _AnHourLater:
+      @staticmethod
+      def monotonic():
+        return time.monotonic() + 3600
+
+    with unittest.mock.patch.object(risco_socket, 'time', _AnHourLater):
+      for n in range(200):
+        task = asyncio.create_task(sock.send_command(f'ZLBL*{n % 50}?'))
+        await settle()
+        cmd_id, command = sock.sent[-1]
+        self.assertNotEqual(cmd_id, 1, 'Do not reuse an ID while its reply is outstanding.')
+        reader.push(cmd_id, f'ZLBL{n % 50}=x')
+        await asyncio.wait_for(task, LOOP_TIMEOUT)
+
+    disarm = asyncio.create_task(sock.send_ack_command('DISARM=1'))
+    await settle()
+    disarm_id = sock.sent[-1][0]
+    self.assertNotEqual(disarm_id, 1)
+    reader.push(1, 'ACK')  # the late one, for ARM
+    await settle()
+    self.assertFalse(disarm.done(), 'A late ARM acknowledgement must not acknowledge DISARM.')
+
+    reader.push(disarm_id, 'ACK')
+    self.assertTrue(await asyncio.wait_for(disarm, LOOP_TIMEOUT))
+
+  async def test_a_command_that_could_not_be_written_does_not_hold_its_id(self):
+    """Release the ID after a failed write because no reply can arrive for that command."""
+    sock, reader = await self._listening()
+
+    def _broken(cmd_id, command, force_encryption=False):
+      raise UnicodeEncodeError('latin-1', command, 0, 1, 'cannot encode')
+
+    sock._write_command = _broken
+    with self.assertRaises(UnicodeEncodeError):
+      await sock.send_command('ZLBL*1=\u05d0')
+
+    self.assertEqual(sock._held, [False] * MAX_CMD_ID)
+
+  async def test_replies_and_pushes_share_one_receive_order(self):
+    sock, reader = await self._listening()
+
+    reader.push(55, 'ZSTT1=O---')
+    await settle()
+    query = asyncio.create_task(sock.send_status_query('ZSTT*1?'))
+    await settle()
+    reader.push(sock.sent[-1][0], 'ZSTT*1=----')
+    status, seq = await asyncio.wait_for(query, LOOP_TIMEOUT)
+    reader.push(56, 'ZSTT1=O---')
+    await settle()
+
+    before, after = [i for i in drain(sock._queue) if isinstance(i, str)]
+    self.assertEqual(status, '----')
+    self.assertLess(before.seq, seq)
+    self.assertGreater(after.seq, seq)
+
+  async def test_a_cancelled_command_holds_its_id_too(self):
+    """Its reply may still be on the way."""
+    sock, reader = await self._listening()
+    task = asyncio.create_task(sock.send_ack_command('ARM=1'))
+    await settle()
+    task.cancel()
+    with self.assertRaises(asyncio.CancelledError):
+      await task
+    sock._cmd_id = MAX_CMD_ID
+
+    self.assertEqual(sock._next_cmd_id(), 2)
+
+  async def test_when_every_id_is_held_a_command_fails_instead_of_reusing_one(self):
+    sock, reader = await self._listening()
+    sock._held = [True] * MAX_CMD_ID
+
+    with self.assertRaises(CommunicationError) as caught:
+      await asyncio.wait_for(sock.send_command('CLOCK'), LOOP_TIMEOUT)
+    self.assertIn('No free command id', str(caught.exception))
+
+  async def test_a_session_with_every_id_held_is_closed_by_the_keep_alive(self):
+    """Ids are held until answered, so a session that lost 49 answers can
+    send nothing more; it is replaced rather than left to fail every command."""
+    sock = connected_socket()
+    sock._held = [True] * MAX_CMD_ID
+
+    with patch_timing(KEEP_ALIVE_INTERVAL=0):
+      await asyncio.wait_for(sock._keep_alive(), LOOP_TIMEOUT)
+
+    self.assertTrue(sock._writer.transport.closing)
+    self.assertTrue(sock._lost)
+    self.assertTrue(any('No free command id' in str(i) for i in drain(sock._queue)))
+
+  async def test_an_answered_command_does_not_hold_its_id(self):
+    sock, reader = await self._listening()
+    task = asyncio.create_task(sock.send_ack_command('ARM=1'))
+    await settle()
+    reader.push(1, 'ACK')
+    self.assertTrue(await asyncio.wait_for(task, LOOP_TIMEOUT))
+    sock._cmd_id = MAX_CMD_ID
+
+    self.assertEqual(sock._next_cmd_id(), 1)
+
+  async def test_an_unexpected_reply_is_still_delivered_if_nothing_timed_out(self):
+    """Replies are matched by id alone, so a panel model that words its
+    replies differently is not broken by any check on their content."""
+    sock, reader = await self._listening()
+
+    result = asyncio.create_task(sock.send_result_command('PNLCNF'))
+    await settle()
+    reader.push(1, 'PANELTYPE=RP432')
+
+    self.assertEqual(await asyncio.wait_for(result, LOOP_TIMEOUT), 'RP432')
 
 
 class LateReplyTest(unittest.IsolatedAsyncioTestCase):
@@ -57,6 +339,30 @@ class LateReplyTest(unittest.IsolatedAsyncioTestCase):
     reported = drain(sock._queue)
     self.assertEqual(len(reported), 1, f'late reply was not ignored: {reported}')
 
+  async def test_a_corrupted_reply_is_reported_but_not_delivered(self):
+    """Discard a corrupted reply because its command ID cannot be trusted.
+
+    Failing the command under that ID could affect an unrelated caller. Let
+    the unanswered command time out and retain its ID instead.
+    """
+    sock = connected_socket()
+    reader = FeedReader(sock)
+    listener = asyncio.create_task(sock._listen())
+    sock._listen_task = listener
+    self.addCleanup(listener.cancel)
+
+    task = asyncio.create_task(sock.send_result_command('RID'))
+    await settle()
+    reader.push(1, 'RID=1A2B', crc=False)
+    await settle()
+
+    self.assertFalse(task.done(), 'Discard a corrupted reply without resolving a command.')
+    reported = drain(sock._queue)
+    self.assertEqual(len(reported), 1, reported)
+    self.assertIsInstance(reported[0], CommunicationError)
+    self.assertIn('Unreadable', str(reported[0]))
+    reader.push(1, 'RID=1A2B')
+    self.assertEqual(await asyncio.wait_for(task, LOOP_TIMEOUT), '1A2B')
 
   async def test_panel_refusal_is_a_plain_operation_error(self):
     """Discovery depends on telling a refusal apart from a lost answer."""

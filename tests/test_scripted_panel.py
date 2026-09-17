@@ -147,6 +147,25 @@ class ConnectTest(ScriptedPanelTestCase):
 
 
 
+  async def test_a_control_carried_out_without_an_answer_is_not_sent_again(self):
+    """Never resend a control whose acknowledgement and status push were lost.
+
+    ZBYPAS toggles the zone, so repeating it could undo the requested change.
+    Keep the last known status until another panel report arrives.
+    """
+    self.panel.rules['ZBYPAS=2'] = [EXECUTE_NO_REPLY]
+    local = RiscoLocal('127.0.0.1', self.panel.port, '1234')
+    await asyncio.wait_for(local.connect(), WAIT)
+    self.addAsyncCleanup(local.disconnect)
+
+    with self.assertRaises(CommunicationError):
+      await asyncio.wait_for(local.zones[2].bypass(True), WAIT)
+    await asyncio.sleep(0.5)  # well past the command timeout
+
+    self.assertEqual(self.panel.sessions[0].received.count('ZBYPAS=2'), 1)
+    self.assertIn('Y', self.panel.statuses[2])
+    self.assertFalse(local.zones[2].bypassed)
+    self.assertEqual(len(self.panel.sessions), 1)
 
   async def test_bypassing_a_zone_is_acknowledged_and_pushed(self):
     local = RiscoLocal('127.0.0.1', self.panel.port, '1234')
@@ -328,6 +347,24 @@ class DiscoveryTest(ScriptedPanelTestCase):
 
 
 
+  async def test_out_of_order_replies_and_stray_errors_reach_the_right_caller(self):
+    """A reply must not answer a command it does not belong to, end to end.
+
+    Replies arrive in random order, some behind an unrelated id-less N05,
+    at the default concurrency of 4. Every zone must come back with its own
+    label.
+    """
+    self.panel.zones = set(range(1, 51))
+    self.panel.scramble = random.Random(20260916)
+    local = RiscoLocal('127.0.0.1', self.panel.port, '1234', concurrency=4)
+
+    with patch_timing(COMMAND_TIMEOUT=1.0):
+      await asyncio.wait_for(local.connect(), 30)
+    self.addAsyncCleanup(local.disconnect)
+
+    self.assertEqual(sorted(local.zones), list(range(1, 51)))
+    wrong = {i: z.name for i, z in local.zones.items() if z.name != f'Zone {i}'}
+    self.assertEqual(wrong, {}, 'Deliver each out-of-order reply to the command that owns its ID.')
 
 
 class RecoveryTest(ScriptedPanelTestCase):
@@ -444,6 +481,28 @@ class RecoveryTest(ScriptedPanelTestCase):
                          for e in supervisor.errors), supervisor.errors)
     supervisor.panel = None
 
+  async def test_a_late_error_reply_does_not_fail_a_later_command(self):
+    """Hold the unanswered command ID so a late refusal cannot fail an unrelated command.
+
+    A refusal has no query key that could distinguish it by content.
+    """
+    local = RiscoLocal('127.0.0.1', self.panel.port, '1234')
+    await asyncio.wait_for(local.connect(), WAIT)
+    self.addAsyncCleanup(local.disconnect)
+    self.panel.late_delay = 0.6
+    self.panel.rules['ZLBL*1?'] = [LATE_REFUSE]  # N05 at 0.6 s
+    self.panel.rules['ZLBL*2?'] = [SILENT]
+
+    with patch_timing(COMMAND_TIMEOUT=0.4):
+      with self.assertRaises(CommunicationError):
+        await asyncio.wait_for(local._rs.send_result_command('ZLBL*1?'), WAIT)
+      # The other ids have come and gone; the next command would get this one.
+      local._rs._cmd_id = self.panel.open_sessions[0].ids['ZLBL*1?'] - 1
+
+      # Waiting from 0.4 s to 0.8 s, across the late N05. Only its own
+      # timeout may end it, not a refusal meant for the command before.
+      with self.assertRaises(CommunicationError):
+        await asyncio.wait_for(local._rs.send_result_command('ZLBL*2?'), WAIT)
 
   async def test_clock_refusals_with_a_command_id_keep_the_session(self):
     """The panel is answering - for example in programming mode - so the

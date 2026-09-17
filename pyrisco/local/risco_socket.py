@@ -45,6 +45,10 @@ class RiscoSocket:
     self._queue = None
     self._cmd_id = 0
     self._futures = [None] * MAX_CMD_ID
+    # Hold unanswered IDs until their reply arrives or the session ends.
+    # Replies identify only the ID; no wait makes reuse safe. Exhaustion
+    # fails commands and reaches keep-alive recovery.
+    self._held = [False] * MAX_CMD_ID
     # Shared receive order for readable replies and pushes this session.
     self._received = 0
     # Only unexpected session loss grows back-off.
@@ -83,6 +87,7 @@ class RiscoSocket:
       self._check_not_disconnected()
       self._semaphore = asyncio.Semaphore(self._max_concurrency)
       self._futures = [None] * MAX_CMD_ID
+      self._held = [False] * MAX_CMD_ID
       self._received = 0
       try:
         async with asyncio.timeout(CONNECT_TIMEOUT):
@@ -174,18 +179,19 @@ class RiscoSocket:
         corrupted = 0
         self._received += 1
         if not cmd_id:
-          self._decrement_cmd_id()
+          # No ID identifies no caller: report it and let commands time out.
           raise CommunicationError(f'Risco error: {command}')
         if cmd_id <= MAX_CMD_ID:
           future = self._futures[cmd_id-1]
           self._futures[cmd_id-1] = None
           if future is None or future.done():
-            pass
+            # A late reply releases its held ID.
+            self._held[cmd_id-1] = False
           elif command[:1] in ('N', 'B'):
             future.set_exception(OperationError(f'cmd_id: {cmd_id}, Risco error: {command}'))
           else:
             # Anything else, even an empty reply, is the answer; the caller judges it.
-            future.set_result(command)
+            future.set_result((command, self._received))
         else:
           await self._handle_incoming(cmd_id, command, queue)
       except READ_FAILURES as error:
@@ -246,11 +252,17 @@ class RiscoSocket:
     return command == 'ACK'
 
   async def send_result_command(self, command):
-    return _value(command, await self.send_command(command))
+    reply, _ = await self._exchange(command)
+    return _value(command, reply)
 
+  async def send_status_query(self, command):
+    """Return the result and receive order; pushes with lower `seq` are older."""
+    reply, seq = await self._exchange(command)
+    return _value(command, reply), seq
 
   async def send_command(self, command, force_encryption=False):
-    return await self._exchange(command, force_encryption)
+    reply, _ = await self._exchange(command, force_encryption)
+    return reply
 
   async def _exchange(self, command, force_encryption=False):
     if self._semaphore is None:
@@ -259,13 +271,14 @@ class RiscoSocket:
       # Recheck after slot waiting: a dead-socket write may silently time out.
       if not self._is_open():
         raise CommunicationError('Not connected')
-      self._increment_cmd_id()
-      cmd_id = self._cmd_id
+      cmd_id = self._next_cmd_id()
       slot = cmd_id - 1
       future = asyncio.get_running_loop().create_future()
       self._futures[slot] = future
+      sent = False
       try:
         self._write_command(cmd_id, command, force_encryption)
+        sent = True
         # Python 3.11 wait_for can swallow cancellation as a reply arrives.
         async with asyncio.timeout(COMMAND_TIMEOUT):
           return await future
@@ -273,7 +286,9 @@ class RiscoSocket:
         raise CommunicationError(f'Timeout in command: {_printable(command)}') from None
       finally:
         if self._futures[slot] is future:
+          # Clear the unanswered future; hold its ID only if the command was sent.
           self._futures[slot] = None
+          self._held[slot] = sent
 
   @property
   def connected(self):
@@ -287,7 +302,9 @@ class RiscoSocket:
 
   async def _handle_incoming(self, cmd_id, command, queue):
     self._write_command(cmd_id, 'ACK')
-    await queue.put(command)
+    push = _Push(command)
+    push.seq = self._received
+    await queue.put(push)
 
   async def _read_command(self):
     buffer = await self._reader.readuntil(END)
@@ -349,17 +366,21 @@ class RiscoSocket:
       return 0
     return max(0, history['closed_at'] + RECONNECT_DELAY - now)
 
-  def _increment_cmd_id(self):
-    self._cmd_id += 1
-    if self._cmd_id > MAX_CMD_ID:
-      self._cmd_id = MIN_CMD_ID
+  def _next_cmd_id(self):
+    """Cycle IDs 1-49, skipping held IDs and occupied slots.
+    Finished futures still own their slots until command cleanup.
+    """
+    for _ in range(MAX_CMD_ID):
+      self._cmd_id = self._cmd_id + 1 if self._cmd_id < MAX_CMD_ID else MIN_CMD_ID
+      slot = self._cmd_id - 1
+      if self._futures[slot] is None and not self._held[slot]:
+        return self._cmd_id
+    raise CommunicationError('No free command id')
 
-  def _decrement_cmd_id(self):
-    self._cmd_id -= 1
-    if self._cmd_id < MIN_CMD_ID:
-      self._cmd_id = MAX_CMD_ID
 
-
+class _Push(str):
+  """A frame the panel sent unasked, with `seq`, its place in receive order."""
+  seq = 0
 
 
 def _value(command, reply):
