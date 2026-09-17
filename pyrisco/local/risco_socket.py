@@ -1,5 +1,5 @@
 import asyncio
-from .risco_crypt import RiscoCrypt, ESCAPED_END, END
+from .risco_crypt import RiscoCrypt, DLE, END
 from pyrisco.common import UnauthorizedError, CannotConnectError, OperationError
 
 MIN_CMD_ID = 1
@@ -121,9 +121,13 @@ class RiscoSocket:
 
   async def _read_command(self):
     buffer = await self._reader.readuntil(END)
-    while buffer.endswith(ESCAPED_END):
+    while _end_is_escaped(buffer):
       buffer += await self._reader.readuntil(END)
-    return self._crypt.decode(buffer)
+    try:
+      return self._crypt.decode(buffer)
+    except (ValueError, IndexError):
+      # Not a frame this session can read: no separator, no id, or cut short.
+      return [None, '', False]
 
   def _write_command(self, cmd_id, command, force_encryption=False):
     buffer = self._crypt.encode(cmd_id, command, force_encryption)
@@ -159,3 +163,9 @@ class RiscoSocket:
     self._cmd_id -= 1
     if self._cmd_id < MIN_CMD_ID:
       self._cmd_id = MAX_CMD_ID
+
+
+def _end_is_escaped(buffer):
+  """An END is data only after an odd DLE count; DLE DLE END ends a frame."""
+  dles = len(buffer) - 1 - len(buffer[:-1].rstrip(DLE))
+  return dles % 2 == 1
