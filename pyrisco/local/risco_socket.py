@@ -20,9 +20,17 @@ KEEP_ALIVE_MAX_FAILURES = 3
 MAX_CORRUPTED_FRAMES = 2
 # Allow the panel to reset encryption before reconnecting.
 RECONNECT_DELAY = 5
+# Early unexpected losses double back-off up to MAX_RECONNECT_DELAY.
+# Stable sessions or long quiet spells reset it; short deliberate closes
+# neither increase nor reset it. Consumers retry waits beyond RECONNECT_DELAY.
+STABLE_SESSION = 120
+MAX_RECONNECT_DELAY = 300
 
 # Terminal reads: retrying can spin. RiscoLocal reports ConnectionLostError.
 READ_FAILURES = (OSError, EOFError, asyncio.LimitOverrunError)
+
+# Sleep through RECONNECT_DELAY plus slack; refuse longer waits.
+_WAIT_SLACK = 0.5
 
 # Share pacing per host/port across instances.
 _panel_history = {}
@@ -51,6 +59,7 @@ class RiscoSocket:
     self._held = [False] * MAX_CMD_ID
     # Shared receive order for readable replies and pushes this session.
     self._received = 0
+    self._established_at = None
     # Only unexpected session loss grows back-off.
     self._lost = False
     self._closing = False
@@ -110,6 +119,7 @@ class RiscoSocket:
         raise CannotConnectError('The panel did not acknowledge the login')
 
       self._check_not_disconnected()
+      self._established_at = time.monotonic()
       self._keep_alive_task = asyncio.create_task(self._keep_alive())
     except asyncio.CancelledError:
       # Cleanup that awaits could itself be interrupted; close synchronously.
@@ -352,19 +362,46 @@ class RiscoSocket:
     self._queue = None
     return writer
 
-  def _record_close(self):
-    _panel_history[(self._host, self._port)] = {'closed_at': time.monotonic(), 'losses': 0}
+  def _record_close(self, now=None):
+    history = _panel_history.setdefault(
+        (self._host, self._port), {'closed_at': None, 'losses': 0})
+    if now is None:
+      now = time.monotonic()
+    previous = history['closed_at']
+    if previous is not None and now - previous > 2 * (STABLE_SESSION + MAX_RECONNECT_DELAY):
+      # A long quiet spell resets back-off.
+      history['losses'] = 0
+    if self._established_at is not None:
+      if now - self._established_at >= STABLE_SESSION:
+        history['losses'] = 0
+      elif self._lost:
+        history['losses'] += 1
+      self._established_at = None
+    history['closed_at'] = now
 
   async def _wait_before_reconnect(self):
     remaining = self._seconds_until_reconnect(time.monotonic())
-    if remaining > 0:
+    if remaining <= 0:
+      return
+    if remaining <= RECONNECT_DELAY + _WAIT_SLACK:
       await asyncio.sleep(remaining)
+      return
+    # Yield once, so a consumer that retries in a loop without waiting does
+    # not freeze the event loop; the retry interval is the consumer's.
+    await asyncio.sleep(0)
+    losses = _panel_history[(self._host, self._port)]['losses']
+    raise CannotConnectError(
+        f'Not reconnecting for another {remaining:.0f} s: '
+        f'the last {losses} sessions were lost soon after connecting')
 
   def _seconds_until_reconnect(self, now):
     history = _panel_history.get((self._host, self._port))
-    if history is None:
+    if history is None or history['closed_at'] is None:
       return 0
-    return max(0, history['closed_at'] + RECONNECT_DELAY - now)
+    # The exponent is capped only to keep the number small; the delay itself
+    # is capped by MAX_RECONNECT_DELAY.
+    delay = min(RECONNECT_DELAY * 2 ** min(history['losses'], 10), MAX_RECONNECT_DELAY)
+    return max(0, history['closed_at'] + delay - now)
 
   def _next_cmd_id(self):
     """Cycle IDs 1-49, skipping held IDs and occupied slots.

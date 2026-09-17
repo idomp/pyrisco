@@ -1231,6 +1231,23 @@ class ConnectWaitTest(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(connections, [], 'Prevent the pending connect from opening a session after disconnect.')
     self.assertIsNone(sock._writer)
 
+  async def test_a_long_back_off_is_refused_rather_than_slept_out(self):
+    """Reject a long reconnect wait promptly so connect() does not hold the consumer's setup lock."""
+    sock = RiscoSocket('127.0.0.1', 9, '1234')
+    risco_socket._panel_history[('127.0.0.1', 9)] = {
+        'closed_at': time.monotonic(), 'losses': 5}
+
+    started = time.monotonic()
+    with patch_timing(RECONNECT_DELAY=1.0, MAX_RECONNECT_DELAY=300):
+      with self.assertRaises(CannotConnectError) as caught:
+        await asyncio.wait_for(sock.connect(), 3)
+    elapsed = time.monotonic() - started
+
+    # Reject a long wait immediately, so the consumer can retry on its own.
+    self.assertLess(elapsed, 0.5)
+    self.assertIn('Not reconnecting for another', str(caught.exception))
+    self.assertIn('5 sessions', str(caught.exception))
+    self.assertIsNone(sock._writer)
 
   async def test_disconnect_during_the_login_fails_the_connect(self):
     """Fail connect() if disconnect() starts during login so a closing session cannot report success."""
@@ -1342,6 +1359,110 @@ def _production_timing():
   return patch_timing(RECONNECT_DELAY=5, STABLE_SESSION=120, MAX_RECONNECT_DELAY=300)
 
 
+class ReconnectPacingTest(unittest.IsolatedAsyncioTestCase):
+  """The panel needs quiet time between sessions, and more after short ones."""
+
+  def setUp(self):
+    reset_reconnect_history()
+    self.addCleanup(reset_reconnect_history)
+
+  def _session(self, host='panel', established_at=None, closed_at=100.0, lost=True):
+    sock = RiscoSocket(host, 1000, '1234')
+    sock._established_at = established_at
+    sock._lost = lost
+    sock._record_close(now=closed_at)
+    return sock
+
+  async def test_first_connect_does_not_wait(self):
+    sock = RiscoSocket('panel', 1000, '1234')
+    self.assertEqual(sock._seconds_until_reconnect(now=0), 0)
+
+  async def test_the_delay_applies_to_a_new_instance(self):
+    """HA reconnects with a new RiscoLocal, so per-instance state is not enough."""
+    self._session(established_at=0.0, closed_at=1000.0)
+    fresh = RiscoSocket('panel', 1000, '1234')
+
+    with _production_timing():
+      self.assertEqual(fresh._seconds_until_reconnect(now=1001.0), 4.0)
+      self.assertEqual(fresh._seconds_until_reconnect(now=1006.0), 0)
+
+  async def test_other_panels_are_not_delayed(self):
+    self._session(host='panel-a', established_at=0.0, closed_at=1000.0)
+    other = RiscoSocket('panel-b', 1000, '1234')
+
+    self.assertEqual(other._seconds_until_reconnect(now=1000.0), 0)
+
+  async def test_consecutive_lost_short_sessions_double_the_delay_up_to_the_cap(self):
+    with _production_timing():
+      delays = []
+      now = 0.0
+      for _ in range(8):
+        sock = self._session(established_at=now, closed_at=now + 30)
+        delays.append(sock._seconds_until_reconnect(now=now + 30))
+        now += 400
+
+    self.assertEqual(delays, [10, 20, 40, 80, 160, 300, 300, 300])
+
+  async def test_a_stable_session_resets_the_delay(self):
+    with _production_timing():
+      self._session(established_at=0.0, closed_at=30.0)
+      self._session(established_at=100.0, closed_at=130.0)
+      stable = self._session(established_at=200.0, closed_at=500.0)
+
+      self.assertEqual(stable._seconds_until_reconnect(now=500.0), 5)
+
+  async def test_deliberate_short_sessions_do_not_escalate(self):
+    """Keep deliberate short sessions from increasing the reconnect back-off.
+
+    Configuration checks and option changes should incur only the panel cooldown.
+    """
+    with _production_timing():
+      for start in (0.0, 40.0, 80.0, 120.0):
+        sock = self._session(established_at=start, closed_at=start + 10, lost=False)
+
+      self.assertEqual(sock._seconds_until_reconnect(now=130.0), 5)
+
+  async def test_a_deliberate_short_close_keeps_the_back_off(self):
+    """Preserve an existing back-off when a short setup session closes deliberately.
+
+    Otherwise repeated setup failures would reset the delay during a loss storm.
+    """
+    with _production_timing():
+      self._session(established_at=0.0, closed_at=30.0)
+      self._session(established_at=60.0, closed_at=90.0)
+      closed = self._session(established_at=150.0, closed_at=160.0, lost=False)
+
+      self.assertEqual(closed._seconds_until_reconnect(now=160.0), 20)
+
+  async def test_a_deliberate_close_of_a_stable_session_starts_over(self):
+    with _production_timing():
+      self._session(established_at=0.0, closed_at=30.0)
+      self._session(established_at=60.0, closed_at=90.0)
+      closed = self._session(established_at=150.0, closed_at=400.0, lost=False)
+
+      self.assertEqual(closed._seconds_until_reconnect(now=400.0), 5)
+
+  async def test_a_long_quiet_spell_starts_over(self):
+    with _production_timing():
+      self._session(established_at=0.0, closed_at=30.0)
+      self._session(established_at=60.0, closed_at=90.0)
+      later = self._session(established_at=5000.0, closed_at=5030.0)
+
+      self.assertEqual(later._seconds_until_reconnect(now=5030.0), 10)
+
+  async def test_a_failed_handshake_does_not_count_as_a_session(self):
+    """Config-flow retries must not escalate the delay."""
+    with _production_timing():
+      for closed_at in (10.0, 20.0, 30.0):
+        sock = self._session(established_at=None, closed_at=closed_at)
+
+      self.assertEqual(sock._seconds_until_reconnect(now=30.0), 5)
+
+  async def test_closing_without_ever_opening_records_nothing(self):
+    sock = RiscoSocket('panel', 1000, '1234')
+    await sock._close()
+
+    self.assertEqual(sock._seconds_until_reconnect(now=time.monotonic()), 0)
 
 
 if __name__ == '__main__':

@@ -677,7 +677,41 @@ class RecoveryTest(ScriptedPanelTestCase):
     gap, = self.reconnect_gaps()
     self.assertGreaterEqual(gap, RECONNECT_DELAY - SLACK)
 
+  async def test_error_replies_to_every_clock_back_off_instead_of_storming(self):
+    """Id-less CLOCK refusals must make reconnects back off, not storm.
 
+    Each session now dies after three failed keep-alives. A panel stuck like
+    that must not be re-initialised every few seconds: the reconnect delay
+    doubles with each short session, up to the cap.
+    """
+    self.panel.rules['CLOCK'] = REFUSE_NO_ID
+    supervisor = await self._connected_supervisor()
+
+    await _until(lambda: len(self.panel.sessions) >= 6, timeout=30,
+                 what='six sessions')
+
+    gaps = self.reconnect_gaps()[:5]
+    expected = [min(RECONNECT_DELAY * 2 ** n, MAX_RECONNECT_DELAY) for n in range(1, 6)]
+    for gap, minimum in zip(gaps, expected):
+      self.assertGreaterEqual(gap, minimum - SLACK, f'gaps {gaps}, expected at least {expected}')
+    self.assert_one_session_at_a_time()
+
+  async def test_a_session_that_survives_resets_the_backoff(self):
+    self.panel.rules['CLOCK'] = REFUSE_NO_ID
+    supervisor = await self._connected_supervisor()
+    await _until(lambda: len(self.panel.sessions) >= 3, timeout=10, what='three sessions')
+
+    del self.panel.rules['CLOCK']
+    # Let a session outlive STABLE_SESSION (2s here), then drop it.
+    await _until(lambda: supervisor.ready.is_set(), what='a stable session')
+    stable = len(self.panel.sessions)
+    await asyncio.sleep(2.3)
+    self.panel.close_sessions()
+    await self._recovered(supervisor, stable + 1)
+
+    gap = self.reconnect_gaps()[-1]
+    self.assertLess(gap, 2 * RECONNECT_DELAY, 'Reset reconnect back-off after a stable session.')
+    self.assertGreaterEqual(gap, RECONNECT_DELAY - SLACK)
 
 
 if __name__ == '__main__':

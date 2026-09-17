@@ -186,7 +186,14 @@ A zone left out at connect stays out until the next `connect()`; its pushes are 
 
 Status pushes that arrive while `connect()` runs are applied after it, unless they are older than the status the zone, partition or system was read with.
 
-`connect()` raises `CannotConnectError` when the panel cannot be reached or does not answer as expected. Other exceptions, such as a `KeyError` for an unsupported panel model, are raised as they are.
+`connect()` raises `CannotConnectError` when the panel cannot be reached, does not answer as expected, or reconnecting now would be too soon. Other exceptions are raised as they are, such as a `KeyError` for an unsupported panel model.
+
+Reconnects are paced per panel:
+
+* Every session that got as far as a TCP connection, a refused login included, is followed by a few seconds' delay, which `connect()` waits out itself.
+* Sessions lost soon after connecting make that delay grow. `connect()` then raises rather than wait, so retry later.
+* A panel that does not accept the TCP connection at all is not paced - leave a gap between attempts yourself.
+* After a process restart the panel may still hold the previous session's state. The first `connect()` can then fail at once ("still encrypting"), and a retry a few seconds later succeeds.
 
 ## Testing PRs
 
