@@ -5,8 +5,8 @@ from .panels import panel_capabilities
 from .partition import Partition
 from .zone import Zone
 from .system import System
-from .risco_socket import RiscoSocket
-from pyrisco.common import OperationError, GROUP_ID_TO_NAME
+from .risco_socket import RiscoSocket, describe
+from pyrisco.common import CannotConnectError, OperationError, GROUP_ID_TO_NAME
 
 
 class RiscoLocal:
@@ -28,24 +28,51 @@ class RiscoLocal:
 
   async def connect(self):
     await self._rs.connect()
-    panel_type = await self._rs.send_result_command("PNLCNF")
-    self._legacy_panel = not panel_type.startswith("RP")
-    if self._legacy_panel:
-      firmware = ""
-    else:
-      firmware = await self._rs.send_result_command("FSVER?")
-    self._panel_capabilities = panel_capabilities(panel_type, firmware)
-    self._id = await self._rs.send_result_command("PNLSERD")
-    self._zones = await self._init_zones()
-    self._partitions = await self._init_partitions()
-    self._system = await self._init_system()
+    try:
+      panel_type = await self._rs.send_result_command("PNLCNF")
+      self._legacy_panel = not panel_type.startswith("RP")
+      if self._legacy_panel:
+        firmware = ""
+      else:
+        firmware = await self._rs.send_result_command("FSVER?")
+      self._panel_capabilities = panel_capabilities(panel_type, firmware)
+      self._id = await self._rs.send_result_command("PNLSERD")
+      self._zones = await self._init_zones()
+      self._partitions = await self._init_partitions()
+      self._system = await self._init_system()
+    except asyncio.CancelledError:
+      # Abort synchronously: another cancellation could interrupt awaited cleanup.
+      self._rs.abort()
+      raise
+    except (OperationError, ValueError) as error:
+      # An unparseable reply is a communication failure.
+      reason = self._rs.close_reason or describe(error)
+      await self._disconnect_after_failed_connect()
+      raise CannotConnectError(reason) from error
+    except Exception:
+      # Close the session while preserving unexpected exceptions.
+      await self._disconnect_after_failed_connect()
+      raise
+
     self._listen_task = asyncio.create_task(self._listen(self._rs.queue))
 
+
+  async def _disconnect_after_failed_connect(self):
+    try:
+      await self._rs.disconnect()
+    except Exception:
+      # Preserve the connect failure.
+      pass
+
   async def disconnect(self):
-    await self._rs.disconnect()
-    if self._listen_task:
-      self._listen_task.cancel()
-      self._listen_task = None
+    listen_task = self._listen_task
+    self._listen_task = None
+    try:
+      await self._rs.disconnect()
+    finally:
+      # Always cancel the listener, except when it is this task.
+      if listen_task is not None and listen_task is not asyncio.current_task():
+        listen_task.cancel()
 
   def add_error_handler(self, handler):
     return RiscoLocal._add_handler(self._error_handlers, handler)

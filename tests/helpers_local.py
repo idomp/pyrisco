@@ -186,6 +186,143 @@ def reset_reconnect_history():
     risco_socket._panel_history.clear()  # versions before the public reset
 
 
+class FakeSocket:
+  """Stand-in for RiscoSocket, for exercising RiscoLocal in isolation.
+
+  `errors`: commands the panel always rejects (an N05 with a command id).
+  `failures`: {command: [outcome, ...]} consumed one per call, where an
+  outcome is an exception to raise or None to answer normally.
+  """
+
+  def __init__(self, responses=None, errors=(), failures=None, default=None):
+    self.responses = dict(responses or {})
+    self.errors = set(errors)
+    self.failures = {k: list(v) for k, v in (failures or {}).items()}
+    self.default = default
+    self.concurrency = 4
+    self.close_reason = None
+    # Receive order send_status_query reports per command (default 0).
+    self.reply_seqs = {}
+    self.queue = asyncio.Queue()
+    self.connected = False
+    self.connect_calls = 0
+    self.disconnect_calls = 0
+    self.abort_calls = 0
+    self.disconnect_error = None
+    self.block_on = None
+    self.blocked = asyncio.Event()
+    self.sent = []
+
+  async def connect(self):
+    self.connect_calls += 1
+    self.connected = True
+
+  async def disconnect(self):
+    self.disconnect_calls += 1
+    if self.disconnect_error is not None:
+      raise self.disconnect_error
+    self.connected = False
+
+  def abort(self):
+    self.abort_calls += 1
+    self.connected = False
+
+  async def send_command(self, command, force_encryption=False, timeout=None):
+    self.sent.append(command)
+    if command == self.block_on:
+      self.blocked.set()
+      await asyncio.sleep(3600)
+    pending = self.failures.get(command)
+    if pending:
+      outcome = pending.pop(0)
+      if outcome is not None:
+        raise outcome
+    if command in self.errors:
+      raise OperationError('cmd_id: 1, Risco error: N05')
+    if command in self.responses:
+      return self.responses[command]
+    if self.default is not None:
+      return self.default(command)
+    raise AssertionError(f'FakeSocket got an unscripted command: {command}')
+
+  async def send_result_command(self, command, timeout=None):
+    return await self.send_command(command, timeout=timeout)
+
+  async def send_status_query(self, command):
+    return await self.send_command(command), self.reply_seqs.get(command, 0)
+
+  async def send_ack_command(self, command, timeout=None):
+    await self.send_command(command, timeout=timeout)
+    return True
+
+
+# RP432M, firmware 6.07.
+# panel_capabilities() normalises on ":" and looks up "RP432", giving
+# MAX_ZONES=50 and MAX_PARTS=4 at firmware >= 3.
+PANEL_TYPE = 'RP432'
+PANEL_FIRMWARE = '6.07'
+MAX_ZONES = 50
+MAX_PARTS = 4
+
+
+def legacy_panel_responses(zones=(1,), partitions=(1,)):
+  """Replies from an Agility (RW132): no FSVER?, ZLNKTYP or ZAREA queries.
+
+  panel_capabilities('RW132', '') gives 36 zones and 3 partitions.
+  """
+  responses = {
+      'PNLCNF': 'RW132',
+      'PNLSERD': '7654321',
+      'SYSLBL?': 'Cottage',
+      'SSTT?': '----',
+  }
+  for i in range(1, 4):
+    responses[f'PSTT{i}?'] = 'E----' if i in partitions else '----'
+    responses[f'PLBL{i}?'] = f'Partition {i}'
+  for i in range(1, 37):
+    if i in zones:
+      responses[f'ZTYPE*{i}?'] = '1'
+      responses[f'ZSTT*{i}?'] = '----'
+      responses[f'ZLBL*{i}?'] = f'Zone {i}'
+      responses[f'ZPART&*{i}?'] = '1'
+    else:
+      responses[f'ZTYPE*{i}?'] = '0'
+  return responses
+
+
+def panel_responses(zones=(1,), partitions=(1,)):
+  """Build a full reply table for RiscoLocal.connect() on an RP432/6.07.
+
+  Zones and partitions not listed answer "does not exist" the way a real
+  panel does (zone type 0 / a partition status with no 'E'), rather than
+  erroring - that distinction is the whole point of several tests.
+  """
+  responses = {
+      'PNLCNF': PANEL_TYPE,
+      'FSVER?': PANEL_FIRMWARE,
+      'PNLSERD': '1234567',
+      'SYSLBL?': 'Home',
+      'SSTT?': '----',
+  }
+  for i in range(1, MAX_PARTS + 1):
+    if i in partitions:
+      responses[f'PSTT{i}?'] = 'E----'
+      responses[f'PLBL{i}?'] = f'Partition {i}'
+    else:
+      responses[f'PSTT{i}?'] = '----'
+  for i in range(1, MAX_ZONES + 1):
+    if i in zones:
+      responses[f'ZTYPE*{i}?'] = '1'
+      responses[f'ZLNKTYP{i}?'] = 'E'
+      responses[f'ZSTT*{i}?'] = '----'
+      responses[f'ZLBL*{i}?'] = f'Zone {i}'
+      responses[f'ZPART&*{i}?'] = '1'
+      responses[f'ZAREA&*{i}?'] = '0'
+    else:
+      responses[f'ZTYPE*{i}?'] = '0'
+  return responses
+
+
 def patch_timing(**overrides):
   """Shrink the socket's timing constants so real-time tests run fast."""
   values = dict(
