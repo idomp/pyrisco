@@ -37,14 +37,20 @@ class RiscoLocal:
     self._partitions = None
     self._id = None
     self._legacy_panel = False
+    self._reported_unknown = set()
+    self._left_out = []
     # Bounded error backlog for the first handler registered.
     self._undelivered = collections.deque(maxlen=MAX_UNDELIVERED_ERRORS)
+    # Receive order of the status each object was read with at connect.
+    self._snapshots = {}
 
   async def connect(self):
     if self._listen_task is not None:
       # Close the previous session and listener first.
       await self.disconnect()
+    self._left_out = []
     self._undelivered.clear()
+    self._snapshots = {}
     await self._rs.connect()
     try:
       panel_type = await self._rs.send_result_command("PNLCNF")
@@ -58,6 +64,11 @@ class RiscoLocal:
       self._zones = await self._init_zones()
       self._partitions = await self._init_partitions()
       self._system = await self._init_system()
+      # A usable panel requires a system and at least one partition.
+      if self._system is None:
+        raise OperationError('Failed to read system status')
+      if not self._partitions:
+        raise OperationError('Panel reported no partitions')
     except asyncio.CancelledError:
       # Abort synchronously: another cancellation could interrupt awaited cleanup.
       self._rs.abort()
@@ -72,8 +83,22 @@ class RiscoLocal:
       await self._disconnect_after_failed_connect()
       raise
 
+    self._reported_unknown = set()
+    self._discard_setup_errors()
+    for error in self._left_out:
+      self._error(error)
     self._listen_task = asyncio.create_task(self._listen(self._rs.queue))
 
+  def _discard_setup_errors(self):
+    """Discard recovered setup errors; retain pushes and connection loss.
+    Keep-alive reports only the first refusal of a run, so a run starting
+    during connect() stays unreported until it ends and recurs.
+    """
+    queue = self._rs.queue
+    for _ in range(queue.qsize()):
+      item = queue.get_nowait()
+      if not isinstance(item, Exception) or isinstance(item, READ_FAILURES):
+        queue.put_nowait(item)
 
   async def _disconnect_after_failed_connect(self):
     try:
@@ -169,11 +194,14 @@ class RiscoLocal:
     return _remove
 
   async def _init_system(self):
+    label = await self._detail('SYSLBL?', '', self._left_out)
     try:
-      label = await self._rs.send_result_command(f'SYSLBL?')
-      status = await self._rs.send_result_command(f'SSTT?')
+      status, seq = await self._ask_twice('SSTT?')
+    except CommunicationError:
+      raise
     except OperationError:
       return None
+    self._snapshots['system'] = seq
     return System(self, label, status)
 
   async def _init_partitions(self):
@@ -183,66 +211,163 @@ class RiscoLocal:
     return await self._get_objects(1, self._panel_capabilities[MAX_ZONES], self._create_zone)
 
   async def _get_objects(self, min, max, func):
-    ids = range(min, min+max)
-    temp = await asyncio.gather(*[func(i) for i in ids])
+    # Bound object concurrency to command slots so retries run immediately;
+    # a silent panel fails after two timeouts, not one per queued object.
+    slots = asyncio.Semaphore(self._rs.concurrency)
+    failures = []
+
+    async def _attempt(object_id):
+      # Publish reports only from the successful object attempt.
+      reports = []
+      result = await func(object_id, reports)
+      self._left_out.extend(reports)
+      return result
+
+    async def _read(object_id):
+      async with slots:
+        try:
+          try:
+            return await _attempt(object_id)
+          except CommunicationError:
+            if not self._rs.connected:
+              raise  # the connection is gone; asking again cannot help
+            # Retry a lost answer once; another failure fails connect, not the object.
+            return await _attempt(object_id)
+        except Exception as error:
+          failures.append(error)
+          raise
+
+    # Stop on first failure; preserve caller cancellation even if a child failed.
+    tasks = [asyncio.create_task(_read(i)) for i in range(min, min+max)]
+    try:
+      await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    finally:
+      # Cancel and drain all reads so no command is left behind.
+      for task in tasks:
+        task.cancel()
+      await asyncio.gather(*tasks, return_exceptions=True)
+    if failures:
+      raise failures[0]  # first in time, not task order
+
+    temp = [task.result() for task in tasks]
     return { o.id: o for o in temp if o }
 
-  async def _create_partition(self, partition_id):
+  async def _create_partition(self, partition_id, reports):
     try:
-      status = await self._rs.send_result_command(f'PSTT{partition_id}?')
-      if not 'E' in status:
-        return None
-
-      label = await self._rs.send_result_command(f'PLBL{partition_id}?')
+      status, seq = await self._ask_twice(f'PSTT{partition_id}?')
+    except CommunicationError:
+      raise
     except OperationError:
+      # How an unused slot answers on some models.
       return None
+    if not 'E' in status:
+      return None
+    label = await self._detail(f'PLBL{partition_id}?', f'Partition {partition_id}', reports)
+    self._snapshots[('partition', partition_id)] = seq
     return Partition(self, partition_id, label, status)
 
-  async def _create_zone(self, zone_id):
+  async def _create_zone(self, zone_id, reports):
     try:
-      zone_type = int(await self._rs.send_result_command(f'ZTYPE*{zone_id}?'))
-      if zone_type == 0:
-        return None
-
-      if self._legacy_panel:
-        tech = ''
-      else:
-        tech = await self._rs.send_result_command(f'ZLNKTYP{zone_id}?')
-        if tech.strip() == 'N':
-          return None
-
-      status = await self._rs.send_result_command(f'ZSTT*{zone_id}?')
-      if status.endswith('N'):
-        return None
-
-      label = await self._rs.send_result_command(f'ZLBL*{zone_id}?')
-      partitions = await self._rs.send_result_command(f'ZPART&*{zone_id}?')
-      if self._legacy_panel:
-        groups = '0'
-      else:
-        groups = await self._rs.send_result_command(f'ZAREA&*{zone_id}?')
-
-      return Zone(self, zone_id, status, zone_type, label, partitions, groups, tech)
+      zone_type = int((await self._ask_twice(f'ZTYPE*{zone_id}?'))[0])
+    except CommunicationError:
+      raise
     except OperationError:
+      # Silently omit: an unused slot and a twice-refused zone look the same.
+      return None
+    if zone_type == 0:
       return None
 
+    tech = '' if self._legacy_panel else await self._detail(f'ZLNKTYP{zone_id}?', '', reports)
+    if tech.strip() == 'N':
+      return None
+    # Never invent a zone status; report and omit a twice-refused zone.
+    try:
+      status, seq = await self._ask_twice(f'ZSTT*{zone_id}?')
+    except CommunicationError:
+      raise
+    except OperationError as error:
+      left_out = OperationError(f'Zone {zone_id} left out: the panel refused its status')
+      left_out.__cause__ = error
+      reports.append(left_out)
+      return None
+    if status.endswith('N'):
+      return None
 
+    label = await self._detail(f'ZLBL*{zone_id}?', f'Zone {zone_id}', reports)
+    partitions = await self._detail(f'ZPART&*{zone_id}?', '0', reports)
+    groups = '0' if self._legacy_panel else await self._detail(f'ZAREA&*{zone_id}?', '0', reports)
+    self._snapshots[('zone', zone_id)] = seq
+    return Zone(self, zone_id, status, zone_type, label, partitions, groups, tech)
 
-  def _system_status(self, status):
+  async def _ask_twice(self, command):
+    """Retry a refused status/type once; _get_objects retries lost answers."""
+    try:
+      return await self._rs.send_status_query(command)
+    except CommunicationError:
+      raise
+    except OperationError:
+      return await self._rs.send_status_query(command)
+
+  async def _detail(self, command, fallback, reports):
+    """Keep known objects: retry a lost answer once while connected.
+    Report a placeholder on refusal or two lost answers; reread next connect.
+    Placeholder partitions/groups mean none, not unknown.
+    """
+    for attempt in range(2):
+      try:
+        return await self._rs.send_result_command(command)
+      except OperationError as error:
+        if isinstance(error, CommunicationError):
+          if not self._rs.connected:
+            raise
+          if attempt == 0:
+            continue
+          report = CommunicationError(
+              f'No answer to {command}; using a placeholder')
+        else:
+          report = OperationError(
+              f'The panel refused {command}; using a placeholder')
+        report.__cause__ = error
+        reports.append(report)
+        return fallback
+
+  def _system_status(self, status, seq=None):
+    if self._is_older_than_snapshot('system', seq):
+      return
     self._system.update_status(status)
     RiscoLocal._call_handlers(self._system_handlers, copy.copy(self._system))
 
-  def _zone_status(self, zone_id, status):
-    z = self._zones[zone_id]
+  def _zone_status(self, zone_id, status, seq=None):
+    z = self._zones.get(zone_id)
+    if z is None:
+      self._report_unknown('zone', zone_id)
+      return
+    if self._is_older_than_snapshot(('zone', zone_id), seq):
+      return
     z.update_status(status)
     RiscoLocal._call_handlers(self._zone_handlers, zone_id, copy.copy(z))
 
-  def _partition_status(self, partition_id, status):
-    p = self._partitions[partition_id]
+  def _partition_status(self, partition_id, status, seq=None):
+    p = self._partitions.get(partition_id)
+    if p is None:
+      self._report_unknown('partition', partition_id)
+      return
+    if self._is_older_than_snapshot(('partition', partition_id), seq):
+      return
     p.update_status(status)
     RiscoLocal._call_handlers(self._partition_handlers, partition_id, copy.copy(p))
 
+  def _is_older_than_snapshot(self, key, seq):
+    """Prevent queued pushes from overwriting newer connect-time snapshots."""
+    snapshot = self._snapshots.get(key)
+    return seq is not None and snapshot is not None and seq < snapshot
 
+  def _report_unknown(self, kind, object_id):
+    # Once per id per connection: the panel repeats a status on every change.
+    if (kind, object_id) in self._reported_unknown:
+      return
+    self._reported_unknown.add((kind, object_id))
+    self._error(OperationError(f'Status update for unknown {kind}: {object_id}'))
 
   def _default(self, command, result, *params):
     RiscoLocal._call_handlers(self._default_handlers, command, result, *params)
@@ -293,13 +418,14 @@ class RiscoLocal:
           continue
 
         command, result, *params = item.split("=")
+        seq = getattr(item, 'seq', None)
 
         if command.startswith('ZSTT'):
-          self._zone_status(int(command[4:]), result)
+          self._zone_status(int(command[4:]), result, seq)
         elif command.startswith('PSTT'):
-          self._partition_status(int(command[4:]), result)
+          self._partition_status(int(command[4:]), result, seq)
         elif command.startswith('SSTT'):
-          self._system_status(result)
+          self._system_status(result, seq)
         else:
           self._default(command, result, *params)
       except Exception as error:

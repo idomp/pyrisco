@@ -304,8 +304,35 @@ class ConnectTest(ScriptedPanelTestCase):
 
 class DiscoveryTest(ScriptedPanelTestCase):
 
+  async def test_an_id_less_error_during_discovery_does_not_lose_a_zone(self):
+    """At the default concurrency the answer is lost; it is asked for again."""
+    self.panel.zones = {1, 2, 3}
+    self.panel.rules['ZTYPE*2?'] = [REFUSE_NO_ID]
+    local = RiscoLocal('127.0.0.1', self.panel.port, '1234', concurrency=4)
 
+    await asyncio.wait_for(local.connect(), WAIT)
+    self.addAsyncCleanup(local.disconnect)
 
+    self.assertEqual(sorted(local.zones), [1, 2, 3])
+
+  async def test_a_refused_zone_query_means_the_zone_is_absent(self):
+    self.panel.zones = {1, 2, 3}
+    self.panel.rules['ZTYPE*2?'] = REFUSE
+    local = RiscoLocal('127.0.0.1', self.panel.port, '1234')
+
+    await asyncio.wait_for(local.connect(), WAIT)
+    self.addAsyncCleanup(local.disconnect)
+
+    self.assertEqual(sorted(local.zones), [1, 3])
+
+  async def test_a_zone_that_never_answers_fails_the_connect(self):
+    """Rather than loading an alarm with a sensor silently missing."""
+    self.panel.zones = {1, 2, 3}
+    self.panel.rules['ZSTT*2?'] = SILENT
+    local = RiscoLocal('127.0.0.1', self.panel.port, '1234')
+
+    with self.assertRaises(CannotConnectError):
+      await asyncio.wait_for(local.connect(), WAIT)
 
   async def test_connecting_a_connected_panel_again_leaves_nothing_running(self):
     """End the previous listener and session when connecting an already connected object."""
@@ -323,11 +350,88 @@ class DiscoveryTest(ScriptedPanelTestCase):
     self.assertIn('DCN', self.panel.sessions[0].received)
     self.assert_one_session_at_a_time()
 
+  async def test_a_connection_lost_during_discovery_is_reported_as_such(self):
+    """Preserve the connection-loss reason and stop discovery instead of retrying a dead session."""
+    self.panel.zones = {1, 2, 3}
+    self.panel.rules['ZLBL*3?'] = CLOSE
+    local = RiscoLocal('127.0.0.1', self.panel.port, '1234')
 
+    with self.assertRaises(CannotConnectError) as caught:
+      await asyncio.wait_for(local.connect(), WAIT)
 
+    self.assertNotIn('Not connected', str(caught.exception))
+    self.assertEqual(local._left_out, [])
 
+  async def test_a_panel_answering_no_zone_query_fails_the_connect_quickly(self):
+    """Fail discovery after two unanswered attempts without waiting for every zone to time out."""
+    self.panel.zones = set(range(1, 51))
+    for zone in range(1, 51):
+      self.panel.rules[f'ZTYPE*{zone}?'] = SILENT
+    local = RiscoLocal('127.0.0.1', self.panel.port, '1234', concurrency=4)
 
+    started = time.monotonic()
+    with patch_timing(COMMAND_TIMEOUT=0.5):
+      with self.assertRaises(CannotConnectError):
+        await asyncio.wait_for(local.connect(), 20)
+    elapsed = time.monotonic() - started
 
+    # Two command timeouts (1 s) plus handshake and teardown. Every zone query
+    # timing out before the first retry would take 50/4 x 0.5 s = 6 s or more.
+    self.assertLess(elapsed, 4.0, f'took {elapsed:.2f}s')
+    await _until(lambda: not self.panel.open_sessions, timeout=1,
+                 what='the panel to see the session closed')
+
+  async def test_a_zone_status_refused_once_does_not_fail_the_connect(self):
+    """Recover from one refused zone status so a transient refusal does not block setup."""
+    self.panel.zones = {1, 2, 3}
+    self.panel.rules['ZSTT*2?'] = [REFUSE]
+    local = RiscoLocal('127.0.0.1', self.panel.port, '1234')
+
+    await asyncio.wait_for(local.connect(), WAIT)
+    self.addAsyncCleanup(local.disconnect)
+
+    self.assertEqual(sorted(local.zones), [1, 2, 3])
+
+  async def test_a_zone_whose_status_is_always_refused_is_left_out_and_reported(self):
+    """Omit and report the unreadable zone so the rest of the panel can connect without invented status."""
+    self.panel.zones = {1, 2, 3}
+    self.panel.rules['ZSTT*2?'] = REFUSE
+    supervisor = self.supervisor()
+
+    await asyncio.wait_for(supervisor.start(), WAIT)
+    await _until(lambda: supervisor.errors, timeout=1, what='the report')
+
+    self.assertEqual(sorted(supervisor.panel.zones), [1, 3])
+    self.assertEqual([str(e) for e in supervisor.errors],
+                     ['Zone 2 left out: the panel refused its status'])
+    self.assertEqual(len(self.panel.sessions), 1)
+
+  async def test_a_refused_detail_gets_a_placeholder_and_is_reported(self):
+    """Report a refused detail and its placeholder instead of silently treating it as real data."""
+    self.panel.zones = {1, 2, 3}
+    self.panel.rules['ZAREA&*2?'] = REFUSE
+    supervisor = self.supervisor()
+
+    await asyncio.wait_for(supervisor.start(), WAIT)
+    await _until(lambda: supervisor.errors, timeout=1, what='the report')
+
+    self.assertEqual(sorted(supervisor.panel.zones), [1, 2, 3])
+    self.assertEqual(supervisor.panel.zones[2].groups, [])
+    self.assertEqual([str(e) for e in supervisor.errors],
+                     ['The panel refused ZAREA&*2?; using a placeholder'])
+
+  async def test_a_push_sent_before_a_status_reply_does_not_overwrite_it(self):
+    """Keep the newer discovery status when an older queued push is handled after connect()."""
+    self.panel.zones = {1, 2}
+    self.panel.statuses[1] = 'O---'
+    self.panel.push_before['ZSTT*1?'] = 'ZSTT1=----'
+    local = RiscoLocal('127.0.0.1', self.panel.port, '1234')
+
+    await asyncio.wait_for(local.connect(), WAIT)
+    self.addAsyncCleanup(local.disconnect)
+    await asyncio.sleep(0.2)
+
+    self.assertTrue(local.zones[1].triggered)
 
   async def test_a_label_in_another_encoding_does_not_lose_the_zone(self):
     """Keep a zone with an undecodable label by replacing invalid characters in its name.
@@ -345,7 +449,55 @@ class DiscoveryTest(ScriptedPanelTestCase):
     self.assertEqual(sorted(local.zones), [1, 2, 3])
     self.assertEqual(local.zones[2].name, 'Entr\ufffde')
 
+  async def test_a_512_zone_panel_is_discovered_without_starving_the_keep_alive(self):
+    """Finish large-panel discovery while allowing keep-alive commands to run.
 
+    Include unused slots, a lost detail and status pushes; require bounded
+    completion with no discovery tasks left running.
+    """
+    self.panel.panel_type = 'RP432MP'  # LightSys+: 512 zones, 32 partitions
+    self.panel.zones = set(range(1, 513, 7))
+    self.panel.reply_delay = 0.001
+    self.panel.rules['ZLBL*8?'] = [SILENT, SILENT]
+    self.panel.push_before['ZTYPE*200?'] = 'ZSTT1=O---'
+    self.panel.push_before['ZSTT*400?'] = 'PSTT1=E----'
+    local = RiscoLocal('127.0.0.1', self.panel.port, '1234', concurrency=4)
+    errors = []
+
+    async def _collect(error):
+      errors.append(error)
+
+    local.add_error_handler(_collect)
+    started = time.monotonic()
+    with patch_timing(COMMAND_TIMEOUT=1.0):
+      await asyncio.wait_for(local.connect(), 60)
+    elapsed = time.monotonic() - started
+    self.addAsyncCleanup(local.disconnect)
+    await asyncio.sleep(0.1)
+
+    self.assertEqual(sorted(local.zones), sorted(self.panel.zones))
+    self.assertEqual(local.zones[8].name, 'Zone 8')
+    self.assertEqual([str(e) for e in errors], ['No answer to ZLBL*8?; using a placeholder'])
+    self.assertLess(elapsed, 30)
+    self.assertEqual(_discovery_tasks(), [])
+
+  async def test_cancelling_a_512_zone_discovery_leaves_nothing_behind(self):
+    """Cancel large-panel discovery without leaving its tasks or session running."""
+    self.panel.panel_type = 'RP432MP'
+    self.panel.zones = set(range(1, 513, 7))
+    self.panel.reply_delay = 0.001
+    local = RiscoLocal('127.0.0.1', self.panel.port, '1234', concurrency=4)
+
+    connecting = asyncio.create_task(local.connect())
+    await _wait(lambda: len(self.panel.sessions) == 1
+                and len(self.panel.sessions[0].received) > 300)
+    connecting.cancel()
+    with self.assertRaises(asyncio.CancelledError):
+      await connecting
+    await _wait(lambda: not self.panel.open_sessions)
+
+    self.assertEqual(_discovery_tasks(), [])
+    self.assertEqual(len(self.panel.sessions), 1)
 
   async def test_out_of_order_replies_and_stray_errors_reach_the_right_caller(self):
     """A reply must not answer a command it does not belong to, end to end.
