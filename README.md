@@ -144,7 +144,6 @@ async def test_local():
       print(f'Partition handler: {partition_id}, {vars(partition)}')
     remove_partition = r.add_partition_handler(_partition)
     
-    await r.connect()
     # partitions and zones are one-based in Cloud
     print(r.partitions[1].armed)
     
@@ -172,6 +171,18 @@ async def test_local():
 
 asyncio.run(test_local())
 ```
+
+#### Errors and connection loss (local)
+
+`RiscoLocal` holds one TCP session to the panel. Error handlers receive:
+
+* `ConnectionLostError` - the session ended without `disconnect()`: the panel closed or reset it, it stopped answering the keep-alive, or its frames became unreadable. The object has disconnected itself; call `connect()` again, on it or on a new instance, to carry on. The socket error is the `__cause__`. It is also a `ConnectionResetError`, for code written against earlier versions.
+* `CommunicationError` - an answer was lost or unreadable, but the session is still up. If the link itself is gone, a `ConnectionLostError` follows.
+* `OperationError` - the panel refused a command.
+
+Handlers run as tasks. An exception a handler raises is logged (`pyrisco.local.risco_local`); `disconnect()` does not cancel handlers still running. Errors reported while no error handler is registered - typically between `connect()` returning and the consumer adding its handlers - are passed to the first one added (at most the last 20).
+
+`connect()` raises `CannotConnectError` when the panel cannot be reached or does not answer as expected. Other exceptions, such as a `KeyError` for an unsupported panel model, are raised as they are.
 
 ## Testing PRs
 

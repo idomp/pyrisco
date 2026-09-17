@@ -1,12 +1,24 @@
 import asyncio
+import collections
 import copy
+import logging
 from .const import PANEL_TYPE, PANEL_MODEL, PANEL_FW, MAX_ZONES, MAX_PARTS, MAX_OUTPUTS
 from .panels import panel_capabilities
 from .partition import Partition
 from .zone import Zone
 from .system import System
-from .risco_socket import RiscoSocket, describe
-from pyrisco.common import CannotConnectError, OperationError, GROUP_ID_TO_NAME
+from .risco_socket import READ_FAILURES, RiscoSocket, describe
+from pyrisco.common import (
+    CannotConnectError, CommunicationError, ConnectionLostError, OperationError, GROUP_ID_TO_NAME)
+
+_LOGGER = logging.getLogger(__name__)
+
+# Errors kept for an error handler that is not registered yet.
+MAX_UNDELIVERED_ERRORS = 20
+
+# Own handler tasks until done: asyncio holds only weak references.
+# disconnect() leaves them running; consumers own handlers that never return.
+_handler_tasks = set()
 
 
 class RiscoLocal:
@@ -25,8 +37,14 @@ class RiscoLocal:
     self._partitions = None
     self._id = None
     self._legacy_panel = False
+    # Bounded error backlog for the first handler registered.
+    self._undelivered = collections.deque(maxlen=MAX_UNDELIVERED_ERRORS)
 
   async def connect(self):
+    if self._listen_task is not None:
+      # Close the previous session and listener first.
+      await self.disconnect()
+    self._undelivered.clear()
     await self._rs.connect()
     try:
       panel_type = await self._rs.send_result_command("PNLCNF")
@@ -75,7 +93,14 @@ class RiscoLocal:
         listen_task.cancel()
 
   def add_error_handler(self, handler):
-    return RiscoLocal._add_handler(self._error_handlers, handler)
+    remove = RiscoLocal._add_handler(self._error_handlers, handler)
+    undelivered = list(self._undelivered)
+    self._undelivered.clear()
+    for error in undelivered:
+      # This handler alone: handlers registered after it did not miss these,
+      # and removing it before the delivery runs must not discard them.
+      RiscoLocal._call_handlers((handler,), error)
+    return remove
 
   def add_event_handler(self, handler):
     return RiscoLocal._add_handler(self._event_handlers, handler)
@@ -201,6 +226,8 @@ class RiscoLocal:
     except OperationError:
       return None
 
+
+
   def _system_status(self, status):
     self._system.update_status(status)
     RiscoLocal._call_handlers(self._system_handlers, copy.copy(self._system))
@@ -215,6 +242,8 @@ class RiscoLocal:
     p.update_status(status)
     RiscoLocal._call_handlers(self._partition_handlers, partition_id, copy.copy(p))
 
+
+
   def _default(self, command, result, *params):
     RiscoLocal._call_handlers(self._default_handlers, command, result, *params)
 
@@ -222,23 +251,37 @@ class RiscoLocal:
     RiscoLocal._call_handlers(self._event_handlers, event)
 
   def _error(self, error):
+    if not self._error_handlers:
+      # Retain errors, including loss during setup, for the first handler.
+      self._undelivered.append(error)
+      return
     RiscoLocal._call_handlers(self._error_handlers, error)
 
   def _call_handlers(handlers, *params):
     if len(handlers) > 0:
       async def _gather():
-        await asyncio.gather(*[h(*params) for h in handlers])
-      asyncio.create_task(_gather())
+        results = await asyncio.gather(*[h(*params) for h in handlers], return_exceptions=True)
+        for result in results:
+          if isinstance(result, Exception):
+            _LOGGER.error('Error in a Risco handler', exc_info=result)
+      task = asyncio.create_task(_gather())
+      _handler_tasks.add(task)
+      task.add_done_callback(_handler_done)
 
   async def _listen(self, queue):
     while True:
       try:
         item = await queue.get()
+        if isinstance(item, READ_FAILURES):
+          # Normalize terminal reads; prefer our close reason to the ensuing EOF.
+          reason = self._rs.close_reason or _name(item)
+          lost = ConnectionLostError(f'Connection lost: {reason}')
+          lost.__cause__ = item
+          self._error(lost)
+          await self.disconnect()
+          break
         if isinstance(item, Exception):
           self._error(item)
-          if isinstance(item, ConnectionResetError):
-            await self.disconnect()
-            break
           continue
 
         if item.startswith('CLOCK'):
@@ -261,3 +304,15 @@ class RiscoLocal:
           self._default(command, result, *params)
       except Exception as error:
         self._error(error)
+
+
+def _handler_done(task):
+  _handler_tasks.discard(task)
+  if not task.cancelled() and task.exception() is not None:
+    # Report handlers that fail before they can be awaited.
+    _LOGGER.error('Error in a Risco handler', exc_info=task.exception())
+
+
+def _name(error):
+  """An exception's type, with its message if it has one."""
+  return f'{type(error).__name__}: {error}' if str(error) else type(error).__name__
