@@ -143,9 +143,60 @@ class ConnectTest(ScriptedPanelTestCase):
     await _until(lambda: not self.panel.open_sessions, timeout=1,
                  what='the panel to see the session closed')
 
+  async def test_a_wrong_code_is_an_authorisation_failure(self):
+    """Classify an identified N06 login refusal as invalid authentication so consumers stop retrying."""
+    local = RiscoLocal('127.0.0.1', self.panel.port, '9999')
 
+    with self.assertRaises(UnauthorizedError):
+      await asyncio.wait_for(local.connect(), WAIT)
 
+    await _until(lambda: not self.panel.open_sessions, timeout=1,
+                 what='the panel to see the session closed')
 
+  async def test_a_login_refusal_other_than_n06_is_retryable(self):
+    """Keep other identified login refusals retryable because they do not establish a wrong code.
+
+    The observed panel also answered N05 to a normally supported query.
+    """
+    for code in ('N05', 'N16', 'N17', 'N11', 'N13', 'N01'):
+      with self.subTest(code=code):
+        reset_reconnect_history()
+        self.panel.refusal_code = code
+        self.panel.rules['RMT=1234'] = [REFUSE]
+        local = RiscoLocal('127.0.0.1', self.panel.port, '1234')
+
+        with self.assertRaises(CannotConnectError) as caught:
+          await asyncio.wait_for(local.connect(), WAIT)
+        self.assertNotIsInstance(caught.exception, UnauthorizedError)
+
+  async def test_an_unexpected_reply_to_the_login_is_retryable(self):
+    """Treat an unexpected login reply as retryable rather than evidence of an incorrect code."""
+    self.panel.duplicate_before['RMT=1234'] = 'ZSTT1=----'
+    local = RiscoLocal('127.0.0.1', self.panel.port, '1234')
+
+    with self.assertRaises(CannotConnectError) as caught:
+      await asyncio.wait_for(local.connect(), WAIT)
+
+    self.assertNotIsInstance(caught.exception, UnauthorizedError)
+
+  async def test_a_login_refusal_without_a_command_id_times_out_as_retryable(self):
+    """Leave an id-less refusal unmatched because it cannot be attributed to the login.
+
+    Even N06 then produces a retryable timeout, so a retrying consumer sends
+    the code again. The observed wrong-code reply carried the login ID; this
+    test covers panels that might omit it.
+    """
+    self.panel.refusal_code = 'N06'
+    self.panel.rules['RMT=1234'] = [REFUSE_NO_ID]
+    local = RiscoLocal('127.0.0.1', self.panel.port, '1234')
+
+    with self.assertRaises(CannotConnectError) as caught:
+      await asyncio.wait_for(local.connect(), WAIT)
+
+    self.assertNotIsInstance(caught.exception, UnauthorizedError)
+    self.assertIn('RMT', str(caught.exception))
+    self.assertNotIn('1234', str(caught.exception))
+    self.assertEqual(self.panel.sessions[0].received.count('RMT=1234'), 1)
 
   async def test_a_control_carried_out_without_an_answer_is_not_sent_again(self):
     """Never resend a control whose acknowledgement and status push were lost.

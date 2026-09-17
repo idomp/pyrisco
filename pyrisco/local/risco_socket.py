@@ -32,6 +32,10 @@ READ_FAILURES = (OSError, EOFError, asyncio.LimitOverrunError)
 # Sleep through RECONNECT_DELAY plus slack; refuse longer waits.
 _WAIT_SLACK = 0.5
 
+# N06 (Invalid Value) means wrong code; retries can log false-code events.
+# Other login refusals are retryable, not authentication failures.
+WRONG_CODE_REFUSALS = ('N06',)
+
 # Share pacing per host/port across instances.
 _panel_history = {}
 
@@ -115,7 +119,16 @@ class RiscoSocket:
       self._crypt.set_panel_id(panel_id)
       if not await self.send_ack_command('LCL'):
         raise CannotConnectError('The panel did not acknowledge LCL')
-      if not await self.send_ack_command(f'RMT={self._code}'):
+      try:
+        authorised = await self.send_ack_command(f'RMT={self._code}')
+      except CommunicationError:
+        raise
+      except OperationError as error:
+        if str(error).endswith(WRONG_CODE_REFUSALS):
+          raise UnauthorizedError('The panel rejected the access code') from error
+        raise CannotConnectError(f'The panel refused the login: {error}') from error
+      if not authorised:
+        # An unexpected login reply is retryable, not evidence of a wrong code.
         raise CannotConnectError('The panel did not acknowledge the login')
 
       self._check_not_disconnected()

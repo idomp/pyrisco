@@ -186,7 +186,12 @@ A zone left out at connect stays out until the next `connect()`; its pushes are 
 
 Status pushes that arrive while `connect()` runs are applied after it, unless they are older than the status the zone, partition or system was read with.
 
-`connect()` raises `CannotConnectError` when the panel cannot be reached, does not answer as expected, or reconnecting now would be too soon. Other exceptions are raised as they are, such as a `KeyError` for an unsupported panel model.
+`connect()` raises:
+
+* `UnauthorizedError` - the panel rejected the access code (`N06`).
+* `CannotConnectError` - the panel could not be reached, did not answer as expected, or reconnecting now would be too soon.
+
+Other exceptions are raised as they are, such as a `KeyError` for an unsupported panel model.
 
 Reconnects are paced per panel:
 
