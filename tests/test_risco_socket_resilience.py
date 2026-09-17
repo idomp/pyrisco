@@ -85,10 +85,69 @@ class LateReplyTest(unittest.IsolatedAsyncioTestCase):
     self.assertIsInstance(reported[0], CommunicationError)
     self.assertNotIn('ZSTT1=O---', reported, 'Discard a corrupted push instead of delivering its status.')
 
+  async def test_unreadable_frames_in_a_row_close_the_connection(self):
+    """Close after consecutive unreadable frames so a new session can restore communication."""
+    sock = connected_socket()
+    scripted_reader(sock, [(None, '', False)] * 2)
 
+    await asyncio.wait_for(sock._listen(), LOOP_TIMEOUT)
 
+    self.assertTrue(sock._writer.transport.closing)
+    self.assertTrue(sock._lost)
+    self.assertTrue(any('unreadable frames in a row' in str(i) for i in drain(sock._queue)))
 
+  async def test_a_readable_frame_between_unreadable_ones_keeps_the_connection(self):
+    sock = connected_socket()
+    scripted_reader(sock, [(None, '', False), (1, 'ACK', True), (None, '', False)])
 
+    await asyncio.wait_for(sock._listen(), LOOP_TIMEOUT)
+
+    self.assertFalse(any('in a row' in str(i) for i in drain(sock._queue)))
+
+  async def test_an_encrypted_frame_before_the_panel_id_closes_at_once(self):
+    """Close immediately if encryption prevents reading the initial panel ID.
+
+    Report the stale session state instead of waiting for the RID timeout.
+    """
+    sock = connected_socket()
+    sock._crypt = RiscoCrypt()
+    panel = RiscoCrypt()
+    panel.set_panel_id(0x15)
+    _feed(sock, bytes(panel.encode(1, 'ACK', force_crypt=True)))
+
+    await asyncio.wait_for(sock._listen(), LOOP_TIMEOUT)
+
+    self.assertTrue(sock._writer.transport.closing)
+    self.assertTrue(any('still encrypting' in str(i) for i in drain(sock._queue)))
+    self.assertIn('still encrypting', sock.close_reason)
+
+  async def test_a_garbled_plaintext_frame_before_the_panel_id_is_only_counted(self):
+    """Count malformed plaintext as unreadable without claiming stale encryption.
+
+    One such frame must not bypass the consecutive-frame shutdown threshold.
+    """
+    sock = connected_socket()
+    sock._crypt = RiscoCrypt()
+    _feed(sock, b'\x02garbage\x03')
+
+    await asyncio.wait_for(sock._listen(), LOOP_TIMEOUT)
+
+    self.assertIsNone(sock.close_reason)
+    self.assertFalse(any('still encrypting' in str(i) for i in drain(sock._queue)))
+
+  async def test_a_plaintext_frame_with_a_bad_crc_before_the_panel_id_is_only_counted(self):
+    """Count a bad plaintext CRC without treating it as stale encryption.
+
+    The normal consecutive-frame threshold still applies before RID completes.
+    """
+    sock = connected_socket()
+    sock._crypt = RiscoCrypt()
+    scripted_reader(sock, [(1, 'RID=0015', False)])
+
+    await asyncio.wait_for(sock._listen(), LOOP_TIMEOUT)
+
+    self.assertIsNone(sock.close_reason)
+    self.assertFalse(any('still encrypting' in str(i) for i in drain(sock._queue)))
 
   def test_a_plaintext_frame_does_not_turn_encryption_off(self):
     """Keep encryption enabled after a stray plaintext frame so the next command stays encrypted."""
@@ -109,6 +168,19 @@ class LateReplyTest(unittest.IsolatedAsyncioTestCase):
 
     self.assertEqual(RiscoCrypt().decode(frame), [None, '', False])
 
+  async def test_a_frame_right_behind_the_rid_reply_does_not_close_the_session(self):
+    """Allow a frame received immediately after RID while connect() stores the panel ID.
+
+    This scheduling window does not prove the panel retained an old session.
+    """
+    sock = connected_socket()
+    sock._crypt = RiscoCrypt()
+    scripted_reader(sock, [(1, 'RID=0015', True), (None, '', False)])
+
+    await asyncio.wait_for(sock._listen(), LOOP_TIMEOUT)
+
+    self.assertIsNone(sock.close_reason)
+    self.assertFalse(any('still encrypting' in str(i) for i in drain(sock._queue)))
 
   async def test_an_empty_reply_answers_its_command(self):
     """Deliver an empty reply to its caller instead of losing the future and timing out."""
@@ -247,6 +319,246 @@ class SendCommandTest(unittest.IsolatedAsyncioTestCase):
     self.assertTrue(all(isinstance(r, CommunicationError) for r in results), results)
 
 
+class KeepAliveTest(unittest.IsolatedAsyncioTestCase):
+  """A link that stops answering must be closed, not polled forever."""
+
+  def _failing_keep_alive(self, sock, error):
+    attempts = []
+
+    async def _fails(command, timeout=None):
+      attempts.append(command)
+      raise error
+
+    sock.send_result_command = _fails
+    return attempts
+
+  async def test_repeated_timeouts_close_the_transport(self):
+    """A session whose answers stop arriving must be given up on."""
+    sock = connected_socket()
+    attempts = self._failing_keep_alive(
+        sock, CommunicationError('Timeout in command: CLOCK'))
+
+    with patch_timing(KEEP_ALIVE_INTERVAL=0):
+      await asyncio.wait_for(sock._keep_alive(), LOOP_TIMEOUT)
+
+    self.assertEqual(len(attempts), 3)
+    self.assertTrue(sock._writer.transport.closed,
+                    'Close the dead transport so the listener can observe EOF.')
+    reported = drain(sock._queue)
+    notice = reported[-1]
+    self.assertIsInstance(notice, OperationError)
+    self.assertIn('closing the connection', str(notice))
+    self.assertIsInstance(notice.__cause__, CommunicationError)
+
+  async def test_refusals_with_a_command_id_do_not_close_the_link(self):
+    """The panel is answering. risco-lan-bridge only warns on a failed CLOCK,
+    and a panel in programming mode can refuse it for minutes.
+
+    An id-less N05 on every CLOCK is not this case: those CLOCKs time out,
+    and timeouts do close the link.
+    """
+    sock = connected_socket()
+    attempts = self._failing_keep_alive(sock, OperationError('cmd_id: 3, Risco error: N05'))
+
+    with patch_timing(KEEP_ALIVE_INTERVAL=0):
+      task = asyncio.create_task(sock._keep_alive())
+      self.addCleanup(task.cancel)
+      await settle(60)
+
+    self.assertGreater(len(attempts), 3)
+    self.assertFalse(task.done(), 'Keep the session open while the panel returns identified refusals.')
+    self.assertFalse(sock._writer.transport.closing)
+    self.assertEqual(len(drain(sock._queue)), 1,
+                     'Report only the first refusal in a continuous run.')
+
+  async def test_each_new_run_of_refusals_is_reported(self):
+    sock = connected_socket()
+    refusal = OperationError('cmd_id: 3, Risco error: N05')
+    results = [refusal, refusal, 'ok', refusal, refusal]
+
+    async def _script(command):
+      if not results:
+        await asyncio.sleep(3600)
+      item = results.pop(0)
+      if isinstance(item, BaseException):
+        raise item
+      return item
+
+    sock.send_result_command = _script
+    with patch_timing(KEEP_ALIVE_INTERVAL=0):
+      task = asyncio.create_task(sock._keep_alive())
+      self.addCleanup(task.cancel)
+      await settle(60)
+
+    self.assertEqual(len(drain(sock._queue)), 2)
+
+  async def test_timeouts_are_reported_even_during_a_run_of_refusals(self):
+    sock = connected_socket()
+    refusal = OperationError('cmd_id: 3, Risco error: N05')
+    timeout = CommunicationError('Timeout in command: CLOCK')
+    results = [refusal, timeout, refusal, 'ok']
+
+    async def _script(command):
+      if not results:
+        await asyncio.sleep(3600)
+      item = results.pop(0)
+      if isinstance(item, BaseException):
+        raise item
+      return item
+
+    sock.send_result_command = _script
+    with patch_timing(KEEP_ALIVE_INTERVAL=0):
+      task = asyncio.create_task(sock._keep_alive())
+      self.addCleanup(task.cancel)
+      await settle(60)
+
+    self.assertEqual(drain(sock._queue), [refusal, timeout])
+
+  async def test_giving_up_records_why(self):
+    sock = connected_socket()
+    self._failing_keep_alive(sock, CommunicationError('Timeout in command: CLOCK'))
+
+    with patch_timing(KEEP_ALIVE_INTERVAL=0):
+      await asyncio.wait_for(sock._keep_alive(), LOOP_TIMEOUT)
+
+    self.assertEqual(sock.close_reason, 'Keep-alive failed 3 times in a row')
+
+  async def test_the_notice_is_a_communication_error_not_a_connection_loss(self):
+    """Consumers reconnect on the EOF that follows, not twice."""
+    sock = connected_socket()
+    self._failing_keep_alive(sock, CommunicationError('Timeout in command: CLOCK'))
+
+    with patch_timing(KEEP_ALIVE_INTERVAL=0):
+      await asyncio.wait_for(sock._keep_alive(), LOOP_TIMEOUT)
+
+    reported = drain(sock._queue)
+    self.assertIsInstance(reported[-1], CommunicationError)
+    self.assertFalse(any(isinstance(i, risco_socket.READ_FAILURES) for i in reported), reported)
+    self.assertTrue(sock._lost, 'Record keep-alive shutdown as an unexpected session loss.')
+
+  async def test_unflushed_data_aborts_instead_of_waiting_to_flush(self):
+    sock = connected_socket()
+    sock._writer.transport.buffered = 64
+    self._failing_keep_alive(sock, CommunicationError('Timeout in command: CLOCK'))
+
+    with patch_timing(KEEP_ALIVE_INTERVAL=0):
+      await asyncio.wait_for(sock._keep_alive(), LOOP_TIMEOUT)
+
+    self.assertTrue(sock._writer.transport.aborted)
+
+  async def test_an_unregistered_keep_alive_stops_when_its_socket_goes(self):
+    """Stop a keep-alive whose socket disappears even if teardown cannot cancel its task.
+
+    The lifetime guard must return before accessing the cleared queue.
+    """
+    sock = connected_socket()
+    sock._listen_task = asyncio.create_task(asyncio.sleep(3600))
+    self.addCleanup(sock._listen_task.cancel)
+    keep_alive = asyncio.create_task(sock._keep_alive())
+    await settle()
+    self.assertEqual([c for _, c in sock.sent], ['CLOCK'])
+
+    sock.abort()
+    done, _ = await asyncio.wait([keep_alive], timeout=LOOP_TIMEOUT)
+
+    self.assertEqual(done, {keep_alive}, 'Stop the keep-alive when its socket is torn down.')
+    self.assertTrue(keep_alive.cancelled() or keep_alive.exception() is None,
+                    f'keep-alive died with {keep_alive.exception()!r}'
+                    if not keep_alive.cancelled() else '')
+
+  async def test_teardown_cancelling_the_registered_keep_alive_ends_it_cleanly(self):
+    """Stop the registered keep-alive when teardown cancels it and fails its pending CLOCK.
+
+    This exercises cancellation through the same task reference used in a session.
+    """
+    sock = connected_socket()
+    sock._listen_task = asyncio.create_task(asyncio.sleep(3600))
+    keep_alive = asyncio.create_task(sock._keep_alive())
+    sock._keep_alive_task = keep_alive
+    await settle()
+    self.assertEqual([c for _, c in sock.sent], ['CLOCK'])
+
+    sock.abort()
+    done, _ = await asyncio.wait([keep_alive], timeout=LOOP_TIMEOUT)
+
+    self.assertEqual(done, {keep_alive}, 'Stop the keep-alive when its socket is torn down.')
+    if not keep_alive.cancelled():
+      self.fail(f'cancellation was lost; the task ended with {keep_alive.exception()!r}')
+
+  async def test_keep_alive_stays_quiet_once_the_listener_reported_the_loss(self):
+    sock = connected_socket()
+    sock._listen_task = asyncio.create_task(asyncio.sleep(0))
+    await settle(3)
+
+    with patch_timing(KEEP_ALIVE_INTERVAL=0):
+      await asyncio.wait_for(sock._keep_alive(), LOOP_TIMEOUT)
+
+    self.assertEqual(drain(sock._queue), [], 'Leave loss reporting to the listener after the socket closes.')
+    self.assertFalse(sock._writer.transport.closing)
+
+  async def test_teardown_while_listening_ends_the_listener_cleanly(self):
+    sock = connected_socket()
+    FeedReader(sock)
+    listener = asyncio.create_task(sock._listen())
+    sock._listen_task = listener
+    await settle()
+
+    sock.abort()
+    done, _ = await asyncio.wait([listener], timeout=LOOP_TIMEOUT)
+
+    self.assertEqual(done, {listener})
+    self.assertTrue(listener.cancelled())
+
+  async def test_a_recovered_keep_alive_keeps_running(self):
+    """One bad CLOCK between good ones must not close anything."""
+    sock = connected_socket()
+    results = ['ok', OperationError('Risco error: N05'), 'ok',
+               OperationError('Risco error: N05'), 'ok']
+
+    async def _flaky(command, timeout=None):
+      if not results:
+        await asyncio.sleep(3600)
+      item = results.pop(0)
+      if isinstance(item, BaseException):
+        raise item
+      return item
+
+    sock.send_result_command = _flaky
+
+    with patch_timing(KEEP_ALIVE_INTERVAL=0):
+      task = asyncio.create_task(sock._keep_alive())
+      self.addCleanup(task.cancel)
+      await settle(60)
+
+    self.assertFalse(task.done(), 'Keep the session open after the keep-alive recovers.')
+    self.assertFalse(sock._writer.transport.closing)
+
+  async def test_closing_the_transport_ends_a_real_listener(self):
+    """End to end over a real socket pair: close -> EOF -> loss reported."""
+    server_ready = asyncio.Event()
+
+    async def _server(reader, writer):
+      server_ready.set()
+      await reader.read()  # hold the connection open, never answer
+
+    port = await serve(self, _server)
+
+    sock = RiscoSocket('127.0.0.1', port, '1234')
+    sock._reader, sock._writer = await asyncio.open_connection('127.0.0.1', port)
+    await server_ready.wait()
+    sock._queue = asyncio.Queue()
+    sock._semaphore = asyncio.Semaphore(4)
+    from pyrisco.local.risco_crypt import RiscoCrypt
+    sock._crypt = RiscoCrypt()
+    sock._listen_task = asyncio.create_task(sock._listen())
+    self.addAsyncCleanup(sock._close)
+
+    with patch_timing(COMMAND_TIMEOUT=0.05, KEEP_ALIVE_INTERVAL=0):
+      await asyncio.wait_for(sock._keep_alive(), LOOP_TIMEOUT)
+      await asyncio.wait_for(sock._listen_task, LOOP_TIMEOUT)
+
+    reported = drain(sock._queue)
+    self.assertIsInstance(reported[-1], (ConnectionError, asyncio.IncompleteReadError))
 
 
 class DisconnectTest(unittest.IsolatedAsyncioTestCase):

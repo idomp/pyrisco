@@ -12,6 +12,12 @@ CONNECT_TIMEOUT = 10
 COMMAND_TIMEOUT = 10
 # Bound both DCN and socket close, including on dead links.
 DISCONNECT_TIMEOUT = 2
+KEEP_ALIVE_INTERVAL = 5
+# Close after consecutive unusable CLOCK answers; an identified refusal
+# proves the link is alive and resets the count.
+KEEP_ALIVE_MAX_FAILURES = 3
+# Consecutive unreadable frames close the session to reset framing/encryption.
+MAX_CORRUPTED_FRAMES = 2
 # Allow the panel to reset encryption before reconnecting.
 RECONNECT_DELAY = 5
 
@@ -39,6 +45,8 @@ class RiscoSocket:
     self._queue = None
     self._cmd_id = 0
     self._futures = [None] * MAX_CMD_ID
+    # Shared receive order for readable replies and pushes this session.
+    self._received = 0
     # Only unexpected session loss grows back-off.
     self._lost = False
     self._closing = False
@@ -75,6 +83,7 @@ class RiscoSocket:
       self._check_not_disconnected()
       self._semaphore = asyncio.Semaphore(self._max_concurrency)
       self._futures = [None] * MAX_CMD_ID
+      self._received = 0
       try:
         async with asyncio.timeout(CONNECT_TIMEOUT):
           self._reader, self._writer = await asyncio.open_connection(self._host, self._port)
@@ -138,13 +147,32 @@ class RiscoSocket:
   async def _listen(self):
     # Keep session references: teardown clears attributes before cancellation lands.
     queue, writer = self._queue, self._writer
+    corrupted = 0
+    given_up = False
     while self._writer is writer:
       try:
         cmd_id, command, crc = await self._read_command()
         _LOGGER.debug('Received %s %s%s', cmd_id, command, '' if crc else ' (unreadable)')
         if not crc:
           # Never deliver or ACK an unreadable frame; even its ID is untrusted.
+          corrupted += 1
+          # Encryption before RID means stale session state; bad plaintext only counts.
+          # After a readable RID, connect() may not yet have stored the panel ID.
+          early = (self._crypt is not None and self._crypt.encrypted_panel
+                   and not self._crypt.has_panel_id and self._received == 0)
+          if (corrupted >= MAX_CORRUPTED_FRAMES or early) and not given_up and not self._closing:
+            given_up = True
+            self._close_reason = (
+                'The panel is still encrypting as for a previous session' if early
+                else f'{corrupted} unreadable frames in a row')
+            await queue.put(CommunicationError(
+                f'{self._close_reason}; closing the connection'))
+            self._lost = True
+            # The listener then reads end-of-stream and reports the loss.
+            _shut_transport(writer)
           raise CommunicationError(f'Unreadable frame (id {cmd_id})')
+        corrupted = 0
+        self._received += 1
         if not cmd_id:
           self._decrement_cmd_id()
           raise CommunicationError(f'Risco error: {command}')
@@ -180,13 +208,38 @@ class RiscoSocket:
       self._futures[i] = None
 
   async def _keep_alive(self):
+    queue, writer = self._queue, self._writer
+    failures = 0
+    refusing = False
     while True:
       try:
         await self.send_result_command("CLOCK")
-      except OperationError as error:
-        await self._queue.put(error)
+        failures = 0
+        refusing = False
+      except Exception as error:
+        if self._writer is not writer or not self._is_open():
+          # Stop for a dead or replaced session; the listener reports loss.
+          return
+        if not isinstance(error, CommunicationError):
+          # A refusal proves liveness; report only the first in a run.
+          failures = 0
+          if not refusing:
+            await queue.put(error)
+          refusing = True
+        else:
+          await queue.put(error)
+          failures += 1
+          if failures >= KEEP_ALIVE_MAX_FAILURES:
+            self._close_reason = f'Keep-alive failed {failures} times in a row'
+            notice = CommunicationError(f'{self._close_reason}; closing the connection')
+            notice.__cause__ = error
+            await queue.put(notice)
+            self._lost = True
+            # EOF makes the listener fail pending commands and report loss.
+            _shut_transport(writer)
+            return
 
-      await asyncio.sleep(5)
+      await asyncio.sleep(KEEP_ALIVE_INTERVAL)
 
   async def send_ack_command(self, command):
     command = await self.send_command(command)
