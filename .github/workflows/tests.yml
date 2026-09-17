@@ -30,3 +30,8 @@ jobs:
         run: |
           set -o pipefail
           python -X dev -m unittest discover -s tests -v 2>&1 | tee test-output.log
+
+      # -X dev prints leaked sockets and unretrieved task exceptions rather
+      # than failing the tests that cause them.
+      - name: Fail on asyncio or resource diagnostics
+        run: python tests/check_diagnostics.py test-output.log
